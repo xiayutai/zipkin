@@ -1,0 +1,21 @@
+#
+# Copyright The OpenZipkin Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+
+# It extends the default configuration from docker-compose.yml, hosting the
+# ui on port 80 using NGINX
+
+
+services:
+  zipkin-ui:
+    image: ghcr.io/openzipkin/zipkin-ui:${TAG:-latest}
+    container_name: zipkin-ui
+    environment:
+      # Change this if connecting to a different zipkin server
+      - ZIPKIN_BASE_URL=http://zipkin:9411
+    ports:
+      - 80:80
+    depends_on:
+      zipkin:
+        condition: service_healthy

@@ -1,7 +1,12 @@
-# Zipkin Release Process
+# OpenZipkin Release Process
 
-This repo uses semantic versions with a twist: we update minors on api-breaks until we hit 1.0. Please keep this
-in mind when choosing version numbers.
+This repo uses semantic versions. Please keep this in mind when choosing version numbers.
+
+1. **Verify all dependencies are up-to-date**
+
+   Before you start a release, make sure all dependencies are up-to-date, or are documented why not.
+   Pay special attention to the [security workflow](.github/workflows/security.yml), which should
+   run clean.
 
 1. **Alert others you are releasing**
 
@@ -11,70 +16,67 @@ in mind when choosing version numbers.
 
 1. **Push a git tag**
 
-   The tag should be of the format `release-N.M.L`, ex `git tag release-1.18.1; git push origin release-1.18.1`.
+   The trigger format is `release-MAJOR.MINOR.PATCH`, ex `git tag release-1.18.1 && git push origin release-1.18.1`.
 
-1. **Wait for Travis CI**
+1. **Wait for CI**
 
-   This part is controlled by [`travis/publish.sh`](travis/publish.sh). It creates a bunch of new commits, bumps
-   the version, publishes artifacts, syncs to Maven Central, and publishes Javaocs to http://zipkin.io/zipkin
-   into a versioned subdirectory.
-   (Note: Javaocs are also published on all builds of master; due to versioning, it doesn't overwrite docs built
-   for releases.)
+   The `release-MAJOR.MINOR.PATCH` tag triggers [`build-bin/maven/maven_release`](build-bin/maven/maven_release),
+   which creates commits, `MAJOR.MINOR.PATCH` tag, and increments the version (maven-release-plugin).
 
-1. **Publish `docker-zipkin`**
+   The `MAJOR.MINOR.PATCH` tag triggers [`build-bin/deploy`](build-bin/deploy), which does the following:
+     * Publishes jars to Sonatype [`build-bin/maven/maven_deploy`](build-bin/maven/maven_deploy)
+       * Later, the same jars synchronize to Maven Central
+     * Publishes Javadoc to https://zipkin.io/brave into a versioned subdirectory
+     * Pushes images to Docker registries [`build-bin/docker_push`](build-bin/docker_push)
 
-   Refer to [docker-zipkin/RELEASE.md](https://github.com/openzipkin/docker-zipkin/blob/master/RELEASE.md).
-   
+   Notes:
+     * https://search.maven.org/ index will take longer than direct links like https://repo1.maven.org/maven2/io/zipkin
+
 ## Credentials
 
-Credentials of various kind are needed for the release process to work. If you notice something
-failing due to unauthorized, re-encrypt them using instructions at the bottom of the `.travis.yml`
-
-Ex You'll see comments like this:
-```yaml
-env:
-  global:
-  # Ex. travis encrypt BINTRAY_USER=your_github_account
-  - secure: "VeTO...
-```
-
-To re-encrypt, you literally run the commands with relevant values and replace the "secure" key with the output:
-
-```bash
-$ travis encrypt BINTRAY_USER=adrianmole
-Please add the following to your .travis.yml file:
-
-  secure: "mQnECL+dXc5l9wCYl/wUz+AaYFGt/1G31NAZcTLf2RbhKo8mUenc4hZNjHCEv+4ZvfYLd/NoTNMhTCxmtBMz1q4CahPKLWCZLoRD1ExeXwRymJPIhxZUPzx9yHPHc5dmgrSYOCJLJKJmHiOl9/bJi123456="
-```
+The release process uses various credentials. If you notice something failing due to unauthorized,
+look at the notes in [.github/workflows/deploy.yml] and check the [org secrets](https://github.com/organizations/openzipkin/settings/secrets/actions).
 
 ### Troubleshooting invalid credentials
 
-If you receive a '401 unauthorized' failure from jCenter or Bintray, it is
-likely `BINTRAY_USER` or `BINTRAY_KEY` entries are invalid, or possibly the user
-associated with them does not have rights to upload.
+If you receive a '401 unauthorized' failure from Sonatype, it is likely
+`SONATYPE_USER` or `SONATYPE_PASSWORD` entries are invalid, or possibly the
+user associated with them does not have rights to upload.
 
 The least destructive test is to try to publish a snapshot manually. By passing
-the values Travis would use, you can kick off a snapshot from your laptop. This
+the values CI would use, you can kick off a snapshot from your laptop. This
 is a good way to validate that your unencrypted credentials are authorized.
 
 Here's an example of a snapshot deploy with specified credentials.
 ```bash
-$ BINTRAY_USER=adrianmole BINTRAY_KEY=ed6f20bde9123bbb2312b221 TRAVIS_PULL_REQUEST=false TRAVIS_TAG= TRAVIS_BRANCH=master travis/publish.sh
+$ export GPG_TTY=$(tty) && GPG_PASSPHRASE=whackamole SONATYPE_USER=adrianmole SONATYPE_PASSWORD=ed6f20bde9123bbb2312b221 build-bin/build-bin/maven/maven_deploy
 ```
 
-## First release of the year
+## Manually releasing
 
-The license plugin verifies license headers of files include a copyright notice indicating the years a file was affected.
-This information is taken from git history. There's a once-a-year problem with files that include version numbers (pom.xml).
-When a release tag is made, it increments version numbers, then commits them to git. On the first release of the year,
-further commands will fail due to the version increments invalidating the copyright statement. The way to sort this out is
-the following:
+If for some reason, you lost access to CI or otherwise cannot get automation to work, bear in mind
+this is a normal maven project, and can be released accordingly.
 
-Before you do the first release of the year, move the SNAPSHOT version back and forth from whatever the current is.
-In-between, re-apply the licenses.
+*Note:* If [Sonatype is down](https://status.sonatype.com/), the below will not work.
+
 ```bash
-$ ./mvnw versions:set -DnewVersion=1.3.3-SNAPSHOT -DgenerateBackupPoms=false
-$ ./mvnw com.mycila:license-maven-plugin:format
-$ ./mvnw versions:set -DnewVersion=1.3.2-SNAPSHOT -DgenerateBackupPoms=false
-$ git commit -am"Adjusts copyright headers for this year"
+# First, set variable according to your personal credentials. These would normally be assigned as
+# org secrets: https://github.com/organizations/openzipkin/settings/secrets/actions
+export GPG_TTY=$(tty)
+export GPG_PASSPHRASE=your_gpg_passphrase
+export SONATYPE_USER=your_sonatype_account
+export SONATYPE_PASSWORD=your_sonatype_password
+release_version=xx-version-to-release-xx
+
+# now from latest master, create the release. This creates and pushes the MAJOR.MINOR.PATCH tag
+./build-bin/maven/maven_release release-${release_version}
+
+# once this works, deploy the release
+git checkout ${release_version}
+./build-bin/deploy
+
+# Finally, clean up
+./mvnw release:clean
+git checkout master
+git reset HEAD --hard
 ```

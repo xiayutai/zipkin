@@ -1,151 +1,152 @@
-/**
- * Copyright 2015-2017 The OpenZipkin Authors
- *
- * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
- * in compliance with the License. You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software distributed under the License
- * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
- * or implied. See the License for the specific language governing permissions and limitations under
- * the License.
+/*
+ * Copyright The OpenZipkin Authors
+ * SPDX-License-Identifier: Apache-2.0
  */
 package zipkin2.elasticsearch;
 
-import com.squareup.moshi.JsonWriter;
-import java.io.IOException;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
-import java.util.logging.Level;
-import java.util.logging.Logger;
-import okio.Buffer;
-import okio.ByteString;
-import zipkin2.Annotation;
 import zipkin2.Call;
 import zipkin2.Span;
-import zipkin2.codec.SpanBytesEncoder;
-import zipkin2.elasticsearch.internal.HttpBulkIndexer;
+import zipkin2.elasticsearch.internal.BulkCallBuilder;
+import zipkin2.elasticsearch.internal.BulkIndexWriter;
 import zipkin2.elasticsearch.internal.IndexNameFormatter;
-import zipkin2.elasticsearch.internal.client.HttpCall;
-import zipkin2.internal.Nullable;
+import zipkin2.internal.DelayLimiter;
 import zipkin2.storage.SpanConsumer;
 
-class ElasticsearchSpanConsumer implements SpanConsumer { // not final for testing
-  static final Logger LOG = Logger.getLogger(ElasticsearchSpanConsumer.class.getName());
+import static zipkin2.elasticsearch.VersionSpecificTemplates.TYPE_AUTOCOMPLETE;
+import static zipkin2.elasticsearch.VersionSpecificTemplates.TYPE_SPAN;
+import static zipkin2.internal.RecyclableBuffers.SHORT_STRING_LENGTH;
 
+class ElasticsearchSpanConsumer implements SpanConsumer { // not final for testing
   final ElasticsearchStorage es;
+  final Set<String> autocompleteKeys;
   final IndexNameFormatter indexNameFormatter;
+  final char indexTypeDelimiter;
+  final boolean searchEnabled;
+  final DelayLimiter<AutocompleteContext> delayLimiter;
 
   ElasticsearchSpanConsumer(ElasticsearchStorage es) {
     this.es = es;
+    this.autocompleteKeys = new LinkedHashSet<>(es.autocompleteKeys());
     this.indexNameFormatter = es.indexNameFormatter();
+    this.indexTypeDelimiter = es.indexTypeDelimiter();
+    this.searchEnabled = es.searchEnabled();
+    this.delayLimiter = DelayLimiter.newBuilder()
+      .ttl(es.autocompleteTtl(), TimeUnit.MILLISECONDS)
+      .cardinality(es.autocompleteCardinality()).build();
+  }
+
+  String formatTypeAndTimestampForInsert(String type, long timestampMillis) {
+    return indexNameFormatter
+      .formatTypeAndTimestampForInsert(type, indexTypeDelimiter, timestampMillis);
   }
 
   @Override public Call<Void> accept(List<Span> spans) {
     if (spans.isEmpty()) return Call.create(null);
-    BulkSpanIndexer indexer = new BulkSpanIndexer(es);
+    BulkSpanIndexer indexer = new BulkSpanIndexer(this);
     indexSpans(indexer, spans);
     return indexer.newCall();
   }
 
   void indexSpans(BulkSpanIndexer indexer, List<Span> spans) {
     for (Span span : spans) {
-      Long spanTimestamp = span.timestamp();
-      long indexTimestamp = 0L; // which index to store this span into
-      if (spanTimestamp != null) {
-        indexTimestamp = spanTimestamp = TimeUnit.MICROSECONDS.toMillis(spanTimestamp);
-      } else {
+      final long indexTimestamp; // which index to store this span into
+      if (span.timestampAsLong() != 0L) {
+        indexTimestamp = span.timestampAsLong() / 1000L;
+      } else if (!span.annotations().isEmpty()) {
         // guessTimestamp is made for determining the span's authoritative timestamp. When choosing
         // the index bucket, any annotation is better than using current time.
-        for (int i = 0, length = span.annotations().size(); i < length; i++) {
-          indexTimestamp = span.annotations().get(i).timestamp() / 1000;
-          break;
-        }
-        if (indexTimestamp == 0L) indexTimestamp = System.currentTimeMillis();
+        indexTimestamp = span.annotations().get(0).timestamp() / 1000L;
+      } else {
+        indexTimestamp = System.currentTimeMillis();
       }
-      indexer.add(indexTimestamp, span, spanTimestamp);
+      indexer.add(indexTimestamp, span);
+      if (searchEnabled && !span.tags().isEmpty()) {
+        indexer.addAutocompleteValues(indexTimestamp, span);
+      }
     }
   }
 
+  /** Mutable type used for each call to store spans */
   static final class BulkSpanIndexer {
-    final HttpBulkIndexer indexer;
-    final IndexNameFormatter indexNameFormatter;
+    final BulkCallBuilder bulkCallBuilder;
+    final ElasticsearchSpanConsumer consumer;
+    final List<AutocompleteContext> pendingAutocompleteContexts = new ArrayList<>();
+    final BulkIndexWriter<Span> spanWriter;
 
-    BulkSpanIndexer(ElasticsearchStorage es) {
-      this.indexer = new HttpBulkIndexer("index-span", es);
-      this.indexNameFormatter = es.indexNameFormatter();
+    BulkSpanIndexer(ElasticsearchSpanConsumer consumer) {
+      this.bulkCallBuilder = new BulkCallBuilder(consumer.es, consumer.es.version(), "index-span");
+      this.consumer = consumer;
+      this.spanWriter =
+        consumer.searchEnabled ? BulkIndexWriter.SPAN : BulkIndexWriter.SPAN_SEARCH_DISABLED;
     }
 
-    void add(long indexTimestamp, Span span, @Nullable Long timestampMillis) {
-      String index = indexNameFormatter.formatTypeAndTimestamp(ElasticsearchSpanStore.SPAN, indexTimestamp);
-      byte[] document = prefixWithTimestampMillisAndQuery(span, timestampMillis);
-      indexer.add(index, ElasticsearchSpanStore.SPAN, document, null /* Allow ES to choose an ID */);
+    void add(long indexTimestamp, Span span) {
+      String index = consumer.formatTypeAndTimestampForInsert(TYPE_SPAN, indexTimestamp);
+      bulkCallBuilder.index(index, TYPE_SPAN, span, spanWriter);
     }
 
-    HttpCall<Void> newCall() {
-      return indexer.newCall();
+    void addAutocompleteValues(long indexTimestamp, Span span) {
+      String idx = consumer.formatTypeAndTimestampForInsert(TYPE_AUTOCOMPLETE, indexTimestamp);
+      for (Map.Entry<String, String> tag : span.tags().entrySet()) {
+        int length = tag.getKey().length() + tag.getValue().length() + 1;
+        if (length > SHORT_STRING_LENGTH) continue;
+
+        // If the autocomplete whitelist doesn't contain the key, skip storing its value
+        if (!consumer.autocompleteKeys.contains(tag.getKey())) continue;
+
+        AutocompleteContext context =
+          new AutocompleteContext(indexTimestamp, tag.getKey(), tag.getValue());
+        if (!consumer.delayLimiter.shouldInvoke(context)) continue;
+        pendingAutocompleteContexts.add(context);
+
+        bulkCallBuilder.index(idx, TYPE_AUTOCOMPLETE, tag, BulkIndexWriter.AUTOCOMPLETE);
+      }
+    }
+
+    Call<Void> newCall() {
+      Call<Void> storeCall = bulkCallBuilder.build();
+      if (pendingAutocompleteContexts.isEmpty()) return storeCall;
+      return storeCall.handleError((error, callback) -> {
+        for (AutocompleteContext context : pendingAutocompleteContexts) {
+          consumer.delayLimiter.invalidate(context);
+        }
+        callback.onError(error);
+      });
     }
   }
 
-  /**
-   * In order to allow systems like Kibana to search by timestamp, we add a field "timestamp_millis"
-   * when storing. The cheapest way to do this without changing the codec is prefixing it to the
-   * json. For example. {"traceId":"... becomes {"timestamp_millis":12345,"traceId":"...
-   *
-   * <p>Tags are stored as a dictionary. Since some tag names will include inconsistent number of
-   * dots (ex "error" and perhaps "error.message"), we cannot index them naturally with
-   * elasticsearch. Instead, we add an index-only (non-source) field of {@code _q} which includes
-   * valid search queries. For example, the tag {@code error -> 500} results in {@code
-   * "_q":["error", "error=500"]}. This matches the input query syntax, and can be checked manually
-   * with curl.
-   *
-   * <p>Ex {@code curl -s localhost:9200/zipkin:span-2017-08-11/_search?q=_q:error=500}
-   */
-  static byte[] prefixWithTimestampMillisAndQuery(Span span, @Nullable Long timestampMillis) {
-    Buffer query = new Buffer();
-    JsonWriter writer = JsonWriter.of(query);
-    try {
-      writer.beginObject();
+  static final class AutocompleteContext {
+    final long timestamp;
+    final String key, value;
 
-      if (timestampMillis != null) writer.name("timestamp_millis").value(timestampMillis);
-      if (!span.tags().isEmpty() || !span.annotations().isEmpty()) {
-        writer.name("_q");
-        writer.beginArray();
-        for (Annotation a : span.annotations()) {
-          if (a.value().length() > 255) continue;
-          writer.value(a.value());
-        }
-        for (Map.Entry<String, String> tag : span.tags().entrySet()) {
-          if (tag.getKey().length() + tag.getValue().length() + 1 > 255) continue;
-          writer.value(tag.getKey()); // search is possible by key alone
-          writer.value(tag.getKey() + "=" + tag.getValue());
-        }
-        writer.endArray();
-      }
-      writer.endObject();
-    } catch (IOException e) {
-      // very unexpected to have an IOE for an in-memory write
-      assert false : "Error indexing query for span: " + span;
-      if (LOG.isLoggable(Level.FINE)) {
-        LOG.log(Level.FINE, "Error indexing query for span: " + span, e);
-      }
-      return SpanBytesEncoder.JSON_V2.encode(span);
+    AutocompleteContext(long timestamp, String key, String value) {
+      this.timestamp = timestamp;
+      this.key = key;
+      this.value = value;
     }
-    byte[] document = SpanBytesEncoder.JSON_V2.encode(span);
-    if (query.rangeEquals(0L, ByteString.of(new byte[] {'{', '}'}))) {
-      return document;
-    }
-    byte[] prefix = query.readByteArray();
 
-    byte[] newSpanBytes = new byte[prefix.length + document.length - 1];
-    int pos = 0;
-    System.arraycopy(prefix, 0, newSpanBytes, pos, prefix.length);
-    pos += prefix.length;
-    newSpanBytes[pos - 1] = ',';
-    // starting at position 1 discards the old head of '{'
-    System.arraycopy(document, 1, newSpanBytes, pos, document.length - 1);
-    return newSpanBytes;
+    @Override public boolean equals(Object o) {
+      if (o == this) return true;
+      if (!(o instanceof AutocompleteContext)) return false;
+      AutocompleteContext that = (AutocompleteContext) o;
+      return timestamp == that.timestamp && key.equals(that.key) && value.equals(that.value);
+    }
+
+    @Override public int hashCode() {
+      int h$ = 1;
+      h$ *= 1000003;
+      h$ ^= (int) (h$ ^ ((timestamp >>> 32) ^ timestamp));
+      h$ *= 1000003;
+      h$ ^= key.hashCode();
+      h$ *= 1000003;
+      h$ ^= value.hashCode();
+      return h$;
+    }
   }
 }

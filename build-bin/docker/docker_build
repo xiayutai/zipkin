@@ -1,0 +1,14 @@
+#!/bin/sh
+#
+# Copyright The OpenZipkin Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+
+set -ue
+
+docker_tag=${1?full docker_tag is required. Ex openzipkin/zipkin:test}
+version=${2:-}
+docker_args=$($(dirname "$0")/docker_args ${version})
+
+echo "Building image ${docker_tag}"
+docker build --network=host --pull ${docker_args} --tag ${docker_tag} .

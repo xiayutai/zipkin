@@ -1,121 +1,90 @@
-/**
- * Copyright 2015-2017 The OpenZipkin Authors
- *
- * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
- * in compliance with the License. You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software distributed under the License
- * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
- * or implied. See the License for the specific language governing permissions and limitations under
- * the License.
+/*
+ * Copyright The OpenZipkin Authors
+ * SPDX-License-Identifier: Apache-2.0
  */
 package zipkin2.elasticsearch;
 
+import com.fasterxml.jackson.core.JsonParser;
 import com.google.auto.value.AutoValue;
 import com.google.auto.value.extension.memoized.Memoized;
-import com.squareup.moshi.JsonReader;
+import com.linecorp.armeria.client.ResponseTimeoutException;
+import com.linecorp.armeria.client.WebClient;
+import com.linecorp.armeria.client.endpoint.EndpointGroup;
+import com.linecorp.armeria.common.AggregatedHttpRequest;
+import com.linecorp.armeria.common.HttpMethod;
+import java.io.Closeable;
 import java.io.IOException;
-import java.util.Collections;
+import java.io.UncheckedIOException;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
-import okhttp3.HttpUrl;
-import okhttp3.MediaType;
-import okhttp3.OkHttpClient;
-import okhttp3.Request;
-import okhttp3.RequestBody;
-import okio.Buffer;
-import okio.BufferedSource;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
+import zipkin2.Call;
 import zipkin2.CheckResult;
 import zipkin2.elasticsearch.internal.IndexNameFormatter;
+import zipkin2.elasticsearch.internal.Internal;
 import zipkin2.elasticsearch.internal.client.HttpCall;
+import zipkin2.elasticsearch.internal.client.HttpCall.BodyConverter;
 import zipkin2.internal.Nullable;
-import zipkin2.internal.Platform;
+import zipkin2.storage.AutocompleteTags;
+import zipkin2.storage.ServiceAndSpanNames;
 import zipkin2.storage.SpanConsumer;
 import zipkin2.storage.SpanStore;
 import zipkin2.storage.StorageComponent;
+import zipkin2.storage.Traces;
 
-import static zipkin2.elasticsearch.ElasticsearchSpanStore.DEPENDENCY;
-import static zipkin2.elasticsearch.ElasticsearchSpanStore.SPAN;
+import static com.linecorp.armeria.common.HttpMethod.GET;
+import static zipkin2.elasticsearch.EnsureIndexTemplate.ensureIndexTemplate;
+import static zipkin2.elasticsearch.VersionSpecificTemplates.TYPE_AUTOCOMPLETE;
+import static zipkin2.elasticsearch.VersionSpecificTemplates.TYPE_DEPENDENCY;
+import static zipkin2.elasticsearch.VersionSpecificTemplates.TYPE_SPAN;
 import static zipkin2.elasticsearch.internal.JsonReaders.enterPath;
 
 @AutoValue
 public abstract class ElasticsearchStorage extends zipkin2.storage.StorageComponent {
-
   /**
-   * A list of elasticsearch nodes to connect to, in http://host:port or https://host:port format.
-   * Note this value is only read once.
+   * This defers creation of an {@link WebClient}. This is needed because routinely, I/O occurs in
+   * constructors and this can delay or cause startup to crash. For example, an underlying {@link
+   * EndpointGroup} could be delayed due to DNS, implicit api calls or health checks.
    */
-  public interface HostsSupplier {
-    List<String> get();
+  public interface LazyHttpClient extends Supplier<WebClient>, Closeable {
+    /**
+     * Lazily creates an instance of the http client configured to the correct elasticsearch host or
+     * cluster. The same value should always be returned.
+     */
+    @Override WebClient get();
+
+    @Override default void close() {
+    }
+
+    /** This should return the initial endpoints in a single-string without resolving them. */
+    @Override String toString();
   }
 
-  static final MediaType APPLICATION_JSON = MediaType.parse("application/json");
-
-  public static Builder newBuilder(OkHttpClient client) {
+  /** The lazy http client supplier will be closed on {@link #close()} */
+  public static Builder newBuilder(LazyHttpClient lazyHttpClient) {
     return new $AutoValue_ElasticsearchStorage.Builder()
-      .client(client)
-      .hosts(Collections.singletonList("http://localhost:9200"))
-      .maxRequests(64)
+      .lazyHttpClient(lazyHttpClient)
       .strictTraceId(true)
+      .searchEnabled(true)
       .index("zipkin")
       .dateSeparator('-')
       .indexShards(5)
       .indexReplicas(1)
+      .ensureTemplates(true)
       .namesLookback(86400000)
-      .shutdownClientOnClose(false)
-      .flushOnWrites(false);
-  }
-
-  public static Builder newBuilder() {
-    Builder result = newBuilder(new OkHttpClient());
-    result.shutdownClientOnClose(true);
-    return result;
+      .flushOnWrites(false)
+      .autocompleteKeys(List.of())
+      .autocompleteTtl((int) TimeUnit.HOURS.toMillis(1))
+      .autocompleteCardinality(5 * 4000); // Ex. 5 site tags with cardinality 4000 each
   }
 
   abstract Builder toBuilder();
 
   @AutoValue.Builder
-  public static abstract class Builder extends StorageComponent.Builder {
-    abstract Builder client(OkHttpClient client);
-
-    public abstract Builder shutdownClientOnClose(boolean shutdownClientOnClose);
-
-    /**
-     * A list of elasticsearch nodes to connect to, in http://host:port or https://host:port format.
-     * Defaults to "http://localhost:9200".
-     */
-    public final Builder hosts(final List<String> hosts) {
-      if (hosts == null) throw new NullPointerException("hosts == null");
-      return hostsSupplier(new HostsSupplier() {
-        @Override public List<String> get() {
-          return hosts;
-        }
-
-        @Override public String toString() {
-          return hosts.toString();
-        }
-      });
-    }
-
-    /**
-     * Like {@link #hosts(List)}, except the value is deferred.
-     *
-     * <p>This was added to support dynamic endpoint resolution for Amazon Elasticsearch. This value
-     * is only read once.
-     */
-    public abstract Builder hostsSupplier(HostsSupplier hosts);
-
-    /**
-     * Sets maximum in-flight requests from this process to any Elasticsearch host. Defaults to 64
-     *
-     * <p>A backlog is not permitted. Once this number of requests are in-flight, future requests
-     * will drop until we are under maxRequests again. This allows the server to remain up during a
-     * traffic surge.
-     */
-    public abstract Builder maxRequests(int maxRequests);
+  public abstract static class Builder extends StorageComponent.Builder {
 
     /**
      * Only valid when the destination is Elasticsearch 5.x. Indicates the ingest pipeline used
@@ -131,12 +100,14 @@ public abstract class ElasticsearchStorage extends zipkin2.storage.StorageCompon
      */
     public abstract Builder namesLookback(int namesLookback);
 
-    /** Visible for testing */
+    /**
+     * Internal and visible only for testing.
+     *
+     * <p>See https://www.elastic.co/guide/en/elasticsearch/reference/current/docs-refresh.html
+     */
     public abstract Builder flushOnWrites(boolean flushOnWrites);
 
-    /**
-     * The index prefix to use when generating daily index names. Defaults to zipkin.
-     */
+    /** The index prefix to use when generating daily index names. Defaults to zipkin. */
     public final Builder index(String index) {
       indexNameFormatterBuilder().index(index);
       return this;
@@ -146,8 +117,9 @@ public abstract class ElasticsearchStorage extends zipkin2.storage.StorageCompon
      * The date separator to use when generating daily index names. Defaults to '-'.
      *
      * <p>By default, spans with a timestamp falling on 2016/03/19 end up in the index
-     * 'zipkin:span-2016-03-19'. When the date separator is '.', the index would be
-     * 'zipkin:span-2016.03.19'.
+     * 'zipkin-span-2016-03-19'. When the date separator is '.', the index would be
+     * 'zipkin-span-2016.03.19'. If the date separator is 0, there is no delimiter. Ex the index
+     * would be 'zipkin-span-20160319'
      */
     public final Builder dateSeparator(char dateSeparator) {
       indexNameFormatterBuilder().dateSeparator(dateSeparator);
@@ -160,7 +132,8 @@ public abstract class ElasticsearchStorage extends zipkin2.storage.StorageCompon
      * improve read and write performance. Number of shards cannot be changed for existing indices,
      * but new daily indices will pick up changes to the setting. Defaults to 5.
      *
-     * <p>Corresponds to <a href="https://www.elastic.co/guide/en/elasticsearch/reference/current/index-modules.html">index.number_of_shards</a>
+     * <p>Corresponds to <a
+     * href="https://www.elastic.co/guide/en/elasticsearch/reference/current/index-modules.html">index.number_of_shards</a>
      */
     public abstract Builder indexShards(int indexShards);
 
@@ -171,13 +144,41 @@ public abstract class ElasticsearchStorage extends zipkin2.storage.StorageCompon
      * changed for existing indices. Defaults to 1. It is highly discouraged to set this to 0 as it
      * would mean a machine failure results in data loss.
      *
-     * <p>Corresponds to <a href="https://www.elastic.co/guide/en/elasticsearch/reference/current/index-modules.html">index.number_of_replicas</a>
+     * <p>Corresponds to <a
+     * href="https://www.elastic.co/guide/en/elasticsearch/reference/current/index-modules.html">index.number_of_replicas</a>
      */
     public abstract Builder indexReplicas(int indexReplicas);
 
+    /** False disables automatic index template installation. */
+    public abstract Builder ensureTemplates(boolean ensureTemplates);
+
+    /**
+     * Only valid when the destination is Elasticsearch >= 7.8. Indicates the index template
+     * priority in case of multiple matching templates. The template with the highest priority is
+     * used. Defaults to 0.
+     *
+     * <p>See https://www.elastic.co/guide/en/elasticsearch/reference/7.8/_index_template_and_settings_priority.html
+     */
+    public abstract Builder templatePriority(@Nullable Integer templatePriority);
+
+    /** {@inheritDoc} */
     @Override public abstract Builder strictTraceId(boolean strictTraceId);
 
+    /** {@inheritDoc} */
+    @Override public abstract Builder searchEnabled(boolean searchEnabled);
+
+    /** {@inheritDoc} */
+    @Override public abstract Builder autocompleteKeys(List<String> autocompleteKeys);
+
+    /** {@inheritDoc} */
+    @Override public abstract Builder autocompleteTtl(int autocompleteTtl);
+
+    /** {@inheritDoc} */
+    @Override public abstract Builder autocompleteCardinality(int autocompleteCardinality);
+
     @Override public abstract ElasticsearchStorage build();
+
+    abstract Builder lazyHttpClient(LazyHttpClient lazyHttpClient);
 
     abstract IndexNameFormatter.Builder indexNameFormatterBuilder();
 
@@ -185,19 +186,21 @@ public abstract class ElasticsearchStorage extends zipkin2.storage.StorageCompon
     }
   }
 
-  abstract OkHttpClient client();
-
-  abstract boolean shutdownClientOnClose();
-
-  public abstract HostsSupplier hostsSupplier();
+  abstract LazyHttpClient lazyHttpClient();
 
   @Nullable public abstract String pipeline();
 
   public abstract boolean flushOnWrites();
 
-  public abstract int maxRequests();
-
   public abstract boolean strictTraceId();
+
+  abstract boolean searchEnabled();
+
+  abstract List<String> autocompleteKeys();
+
+  abstract int autocompleteTtl();
+
+  abstract int autocompleteCardinality();
 
   abstract int indexShards();
 
@@ -205,11 +208,28 @@ public abstract class ElasticsearchStorage extends zipkin2.storage.StorageCompon
 
   public abstract IndexNameFormatter indexNameFormatter();
 
+  abstract boolean ensureTemplates();
+
   public abstract int namesLookback();
+
+  @Nullable abstract Integer templatePriority();
 
   @Override public SpanStore spanStore() {
     ensureIndexTemplates();
     return new ElasticsearchSpanStore(this);
+  }
+
+  @Override public Traces traces() {
+    return (Traces) spanStore();
+  }
+
+  @Override public ServiceAndSpanNames serviceAndSpanNames() {
+    return (ServiceAndSpanNames) spanStore();
+  }
+
+  @Override public AutocompleteTags autocompleteTags() {
+    ensureIndexTemplates();
+    return new ElasticsearchAutocompleteTags(this);
   }
 
   @Override public SpanConsumer spanConsumer() {
@@ -217,110 +237,158 @@ public abstract class ElasticsearchStorage extends zipkin2.storage.StorageCompon
     return new ElasticsearchSpanConsumer(this);
   }
 
-  /** Returns the Elasticsearch version of the connected cluster. Internal use only */
-  public float version() {
-    return ensureIndexTemplates().version();
+  /** Returns the Elasticsearch / OpenSearch version of the connected cluster. Internal use only */
+  @Memoized public BaseVersion version() {
+    try {
+      return BaseVersion.get(http());
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
   }
 
-  /** This is a blocking call, only used in tests. */
+  char indexTypeDelimiter() {
+    return VersionSpecificTemplates.forVersion(version()).indexTypeDelimiter();
+  }
+
+  /** This is an internal blocking call, only used in tests. */
   public void clear() throws IOException {
     Set<String> toClear = new LinkedHashSet<>();
-    toClear.add(indexNameFormatter().formatType(SPAN));
-    toClear.add(indexNameFormatter().formatType(DEPENDENCY));
+    toClear.add(indexNameFormatter().formatType(TYPE_SPAN));
+    toClear.add(indexNameFormatter().formatType(TYPE_DEPENDENCY));
+    // Note: Elasticsearch 8.x requires this config to clear with wildcards:
+    // action.destructive_requires_name: false
     for (String index : toClear) clear(index);
   }
 
   void clear(String index) throws IOException {
-    Request deleteRequest = new Request.Builder()
-      .url(http().baseUrl.newBuilder().addPathSegment(index).build())
-      .delete().tag("delete-index").build();
-
-    http().newCall(deleteRequest, BodyConverters.NULL).execute();
-
-    flush(http(), index);
+    String url = '/' + index;
+    AggregatedHttpRequest delete = AggregatedHttpRequest.of(HttpMethod.DELETE, url);
+    http().newCall(delete, BodyConverters.NULL, "delete-index").execute();
   }
 
-  /** This is a blocking call, only used in tests. */
-  public static void flush(HttpCall.Factory factory, String index) throws IOException {
-    Request flushRequest = new Request.Builder()
-      .url(factory.baseUrl.newBuilder().addPathSegment(index).addPathSegment("_flush").build())
-      .post(RequestBody.create(APPLICATION_JSON, ""))
-      .tag("flush-index").build();
-
-    factory.newCall(flushRequest, BodyConverters.NULL).execute();
+  /**
+   * Internal code and api responses coerce to {@link RejectedExecutionException} when work is
+   * rejected. We also classify {@link ResponseTimeoutException} as a capacity related exception
+   * even though capacity is not the only reason (timeout could also result from a misconfiguration
+   * or a network problem).
+   */
+  @Override public boolean isOverCapacity(Throwable e) {
+    return e instanceof RejectedExecutionException || e instanceof ResponseTimeoutException;
   }
 
   /** This is blocking so that we can determine if the cluster is healthy or not */
   @Override public CheckResult check() {
-    return ensureClusterReady(indexNameFormatter().formatType(SPAN));
+    return ensureIndexTemplatesAndClusterReady(indexNameFormatter().formatType(TYPE_SPAN));
   }
 
-  CheckResult ensureClusterReady(String index) {
-    Request request = new Request.Builder().url(http().baseUrl.resolve("/_cluster/health/" + index))
-      .tag("get-cluster-health").build();
-
+  /**
+   * This allows the health check to display problems, such as access, installing the index
+   * template. It also helps reduce traffic sent to nodes still initializing (when guarded on the
+   * check result). Finally, this reads the cluster health of the index as it can go down after the
+   * one-time initialization passes.
+   */
+  CheckResult ensureIndexTemplatesAndClusterReady(String index) {
     try {
-      return http().newCall(request, ReadStatus.INSTANCE).execute();
-    } catch (IOException | RuntimeException e) {
+      version(); // ensure the version is available (even if we already cached it)
+      ensureIndexTemplates(); // called only once, so we have to double-check health
+      AggregatedHttpRequest request = AggregatedHttpRequest.of(GET, "/_cluster/health/" + index);
+      CheckResult result = http().newCall(request, READ_STATUS, "get-cluster-health").execute();
+      if (result == null) throw new IllegalArgumentException("No content reading cluster health");
+      return result;
+    } catch (Throwable e) {
+      Call.propagateIfFatal(e);
+      // Wrapping interferes with humans intended to read this message:
+      //
+      // Unwrap the marker exception as the health check is not relevant for the throttle component.
+      // Unwrap any IOException from the first call to ensureIndexTemplates()
+      if (e instanceof RejectedExecutionException || e instanceof UncheckedIOException) {
+        return CheckResult.failed(e.getCause());
+      }
       return CheckResult.failed(e);
     }
   }
 
-  enum ReadStatus implements HttpCall.BodyConverter<CheckResult> {
-    INSTANCE;
+  volatile boolean ensuredTemplates;
 
-    @Override public CheckResult convert(BufferedSource b) throws IOException {
-      b.request(Long.MAX_VALUE); // Buffer the entire body.
-      Buffer body = b.buffer();
-      JsonReader status = enterPath(JsonReader.of(body.clone()), "status");
-      if (status == null) {
-        throw new IllegalStateException("Health status couldn't be read " + body.readUtf8());
-      }
-      if ("RED".equalsIgnoreCase(status.nextString())) {
-        throw new IllegalStateException("Health status is RED");
-      }
-      return CheckResult.OK;
-    }
-
-    @Override public String toString(){
-      return "ReadStatus";
+  // synchronized since we don't want overlapping calls to apply the index templates
+  void ensureIndexTemplates() {
+    if (ensuredTemplates) return;
+    if (!ensureTemplates()) ensuredTemplates = true;
+    synchronized (this) {
+      if (ensuredTemplates) return;
+      doEnsureIndexTemplates();
+      ensuredTemplates = true;
     }
   }
 
-  @Memoized // since we don't want overlapping calls to apply the index templates
-  IndexTemplates ensureIndexTemplates() {
-    String index = indexNameFormatter().index();
+  IndexTemplates doEnsureIndexTemplates() {
     try {
-      IndexTemplates templates = new VersionSpecificTemplates(this).get(http());
-      EnsureIndexTemplate.apply(http(), index + ":" + SPAN + "_template", templates.span());
-      EnsureIndexTemplate.apply(http(), index + ":" + DEPENDENCY + "_template",
-        templates.dependency());
+      HttpCall.Factory http = http();
+      IndexTemplates templates = versionSpecificTemplates(version());
+      ensureIndexTemplate(http, buildUrl(templates, TYPE_SPAN), templates.span());
+      ensureIndexTemplate(http, buildUrl(templates, TYPE_DEPENDENCY), templates.dependency());
+      ensureIndexTemplate(http, buildUrl(templates, TYPE_AUTOCOMPLETE), templates.autocomplete());
       return templates;
     } catch (IOException e) {
-      throw Platform.get().uncheckedIOException(e);
+      throw new UncheckedIOException(e);
     }
   }
 
-  @Memoized
-  public // hosts resolution might imply a network call, and we might make a new okhttp instance
-  HttpCall.Factory http() {
-    List<String> hosts = hostsSupplier().get();
-    if (hosts.isEmpty()) throw new IllegalArgumentException("no hosts configured");
-    OkHttpClient ok = hosts.size() == 1
-      ? client()
-      : client().newBuilder()
-        .dns(PseudoAddressRecordSet.create(hosts, client().dns()))
-        .build();
-    ok.dispatcher().setMaxRequests(maxRequests());
-    ok.dispatcher().setMaxRequestsPerHost(maxRequests());
-    return new HttpCall.Factory(ok, HttpUrl.parse(hosts.get(0)));
+  IndexTemplates versionSpecificTemplates(BaseVersion version) {
+    return VersionSpecificTemplates.forVersion(version).get(
+      indexNameFormatter().index(),
+      indexReplicas(),
+      indexShards(),
+      searchEnabled(),
+      strictTraceId(),
+      templatePriority()
+    );
+  }
+
+  String buildUrl(IndexTemplates templates, String type) {
+    String indexPrefix = indexNameFormatter().index() + templates.indexTypeDelimiter();
+    return VersionSpecificTemplates.forVersion(version()).indexTemplatesUrl(indexPrefix, type, templatePriority());
+  }
+
+  @Override public final String toString() {
+    return "ElasticsearchStorage{initialEndpoints=" + lazyHttpClient()
+      + ", index=" + indexNameFormatter().index() + "}";
+  }
+
+  static {
+    Internal.instance = new Internal() {
+      @Override public HttpCall.Factory http(ElasticsearchStorage storage) {
+        return storage.http();
+      }
+    };
+  }
+
+  @Memoized HttpCall.Factory http() {
+    return new HttpCall.Factory(lazyHttpClient().get());
   }
 
   @Override public void close() {
-    if (!shutdownClientOnClose()) return;
-    http().close();
+    lazyHttpClient().close();
   }
 
   ElasticsearchStorage() {
   }
+
+  static final BodyConverter<CheckResult> READ_STATUS = new BodyConverter<CheckResult>() {
+    @Override public CheckResult convert(JsonParser parser, Supplier<String> contentString)
+      throws IOException {
+      JsonParser status = enterPath(parser, "status");
+      if (status == null) {
+        throw new IllegalArgumentException("Health status couldn't be read " + contentString.get());
+      }
+      if ("RED".equalsIgnoreCase(status.getText())) {
+        return CheckResult.failed(new IllegalStateException("Health status is RED"));
+      }
+      return CheckResult.OK;
+    }
+
+    @Override public String toString() {
+      return "ReadStatus";
+    }
+  };
 }

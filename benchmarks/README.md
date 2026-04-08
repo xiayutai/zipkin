@@ -1,25 +1,17 @@
-Zipkin Benchmarks
-===================
+# zipkin-benchmarks
 
-This module includes [JMH](http://openjdk.java.net/projects/code-tools/jmh/) benchmarks for Zipkin.
+This module includes [JMH](http://openjdk.java.net/projects/code-tools/jmh/)
+benchmarks for zipkin. You can use these to measure overhead.
 
-=== Running the benchmark
-From the parent directory, run `./mvnw install` to build the benchmarks, and the following to run them:
+### Running the benchmark
+From the project directory, run this to build the benchmarks:
 
 ```bash
-# Run with a single worker thread
-$ java -jar benchmarks/target/benchmarks.jar
-# Add contention by running with 4 threads
-$ java -jar benchmarks/target/benchmarks.jar -t4
+$ ./mvnw install -pl benchmarks -am -Dmaven.test.skip.exec=true
 ```
 
-=== Updating thrifts
-Thrift changes are not frequent, but when they occur, please update the generated source.
+and the following to run them:
 
 ```bash
-$ git clone https://github.com/openzipkin/zipkin-api
-$ rm -rf src/main/java/com
-$ thrift -r --gen java -out src/main/java zipkin-api/thrift/zipkinCore.thrift
-$ mvn  com.mycila:license-maven-plugin:format
-$ rm -rf zipkin-api
+$ java -jar benchmarks/target/benchmarks.jar
 ```

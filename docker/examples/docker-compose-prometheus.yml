@@ -1,0 +1,48 @@
+#
+# Copyright The OpenZipkin Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+
+# This runs containers that collect data for our Grafana dashboard
+#
+# Note that this file is meant for learning Zipkin, not production deployments.
+
+
+services:
+  prometheus:
+    # Use a quay.io mirror to prevent build outages due to Docker Hub pull quotas
+    # Use latest from https://quay.io/repository/prometheus/prometheus?tab=tags
+    image: quay.io/prometheus/prometheus:v3.10.0
+    container_name: prometheus
+    ports:
+      - 9090:9090
+    depends_on:
+      zipkin:
+        condition: service_healthy
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+
+  grafana:
+    # Use a quay.io mirror to prevent build outages due to Docker Hub pull quotas
+    # Use latest from https://quay.io/repository/giantswarm/grafana?tab=tags
+    image: quay.io/giantswarm/grafana:11.6.7
+    container_name: grafana
+    ports:
+      - 3000:3000
+    depends_on:
+      - prometheus
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+
+  setup_grafana_datasource:
+    # This is a small Alpine-based image from the official curl project
+    # Use latest from https://quay.io/repository/curl/curl-base?tab=tags
+    image: quay.io/curl/curl-base:8.18.0
+    container_name: setup_grafana_datasource
+    depends_on:
+      - grafana
+    volumes:
+      - ./prometheus/create-datasource-and-dashboard.sh:/tmp/create.sh:ro
+    working_dir: /tmp
+    entrypoint: /tmp/create.sh

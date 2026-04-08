@@ -1,242 +1,160 @@
-/**
- * Copyright 2015-2017 The OpenZipkin Authors
- *
- * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
- * in compliance with the License. You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software distributed under the License
- * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
- * or implied. See the License for the specific language governing permissions and limitations under
- * the License.
+/*
+ * Copyright The OpenZipkin Authors
+ * SPDX-License-Identifier: Apache-2.0
  */
 package zipkin2.elasticsearch;
 
+import com.linecorp.armeria.client.WebClient;
+import com.linecorp.armeria.common.AggregatedHttpRequest;
+import com.linecorp.armeria.common.AggregatedHttpResponse;
+import com.linecorp.armeria.common.HttpData;
+import com.linecorp.armeria.common.HttpStatus;
+import com.linecorp.armeria.common.MediaType;
+import com.linecorp.armeria.common.ResponseHeaders;
+import com.linecorp.armeria.testing.junit5.server.mock.MockWebServerExtension;
 import java.io.IOException;
-import java.util.concurrent.LinkedBlockingQueue;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
-import okhttp3.mockwebserver.MockResponse;
-import okhttp3.mockwebserver.MockWebServer;
-import okhttp3.mockwebserver.RecordedRequest;
-import org.junit.After;
-import org.junit.Before;
-import org.junit.Rule;
-import org.junit.Test;
-import zipkin2.Callback;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
 import zipkin2.Endpoint;
 import zipkin2.Span;
 import zipkin2.Span.Kind;
-import zipkin2.codec.SpanBytesDecoder;
 import zipkin2.codec.SpanBytesEncoder;
-import zipkin2.internal.Nullable;
+import zipkin2.storage.SpanConsumer;
 
-import static java.util.Arrays.asList;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.failBecauseExceptionWasNotThrown;
-import static zipkin2.elasticsearch.ElasticsearchSpanConsumer.prefixWithTimestampMillisAndQuery;
+import static zipkin2.TestObjects.TODAY;
+import static zipkin2.TestObjects.UTF_8;
 
-public class ElasticsearchSpanConsumerTest {
+class ElasticsearchSpanConsumerTest {
   static final Endpoint WEB_ENDPOINT = Endpoint.newBuilder().serviceName("web").build();
   static final Endpoint APP_ENDPOINT = Endpoint.newBuilder().serviceName("app").build();
 
-  @Rule public MockWebServer es = new MockWebServer();
+  final AggregatedHttpResponse SUCCESS_RESPONSE =
+    AggregatedHttpResponse.of(ResponseHeaders.of(HttpStatus.OK), HttpData.empty());
 
-  ElasticsearchStorage storage = ElasticsearchStorage.newBuilder()
-    .hosts(asList(es.url("").toString()))
-    .build();
+  @RegisterExtension static MockWebServerExtension server = new MockWebServerExtension();
 
-  /** gets the index template so that each test doesn't have to */
-  @Before
-  public void ensureIndexTemplate() throws Exception {
-    es.enqueue(new MockResponse().setBody("{\"version\":{\"number\":\"6.0.0\"}}"));
-    es.enqueue(new MockResponse()); // get span template
-    es.enqueue(new MockResponse()); // get dependency template
-    storage.ensureIndexTemplates();
-    es.takeRequest(); // get version
-    es.takeRequest(); // get span template
-    es.takeRequest(); // get dependency template
+  ElasticsearchStorage storage;
+  SpanConsumer spanConsumer;
+
+  @BeforeEach void setUp() throws Exception {
+    storage = ElasticsearchStorage.newBuilder(() -> WebClient.of(server.httpUri()))
+      .autocompleteKeys(List.of("environment"))
+      .build();
+
+    ensureIndexTemplate();
   }
 
-  @After
-  public void close() throws IOException {
+  @AfterEach void tearDown() throws IOException {
     storage.close();
   }
 
-  @Test public void addsTimestamp_millisIntoJson() throws Exception {
-    es.enqueue(new MockResponse());
+  void ensureIndexTemplate() throws Exception {
+    // gets the index template so that each test doesn't have to
+    ensureIndexTemplates(storage);
+    spanConsumer = storage.spanConsumer();
+  }
 
-    Span span = Span.newBuilder().traceId("20").id("20").name("get")
-      .timestamp(TestObjects.TODAY * 1000).build();
+  private void ensureIndexTemplates(ElasticsearchStorage storage) throws InterruptedException {
+    server.enqueue(AggregatedHttpResponse.of(HttpStatus.OK, MediaType.JSON_UTF_8,
+      "{\"version\":{\"number\":\"6.0.0\"}}"));
+    server.enqueue(SUCCESS_RESPONSE); // get span template
+    server.enqueue(SUCCESS_RESPONSE); // get dependency template
+    server.enqueue(SUCCESS_RESPONSE); // get tags template
+    storage.ensureIndexTemplates();
+    server.takeRequest(); // get version
+    server.takeRequest(); // get span template
+    server.takeRequest(); // get dependency template
+    server.takeRequest(); // get tags template
+  }
+
+  @Test void addsTimestamp_millisIntoJson() throws Exception {
+    server.enqueue(SUCCESS_RESPONSE);
+
+    Span span =
+      Span.newBuilder().traceId("20").id("20").name("get").timestamp(TODAY * 1000).build();
 
     accept(span);
 
-    assertThat(es.takeRequest().getBody().readUtf8())
-      .contains("\n{\"timestamp_millis\":" + Long.toString(TestObjects.TODAY) + ",\"traceId\":");
+    assertThat(server.takeRequest().request().contentUtf8())
+      .contains("\n{\"timestamp_millis\":" + TODAY + ",\"traceId\":");
   }
 
-  @Test public void prefixWithTimestampMillisAndQuery_skipsWhenNoData() throws Exception {
-    Span span = Span.newBuilder().traceId("20").id("22").name("").parentId("21").timestamp(0L)
-      .localEndpoint(WEB_ENDPOINT)
-      .kind(Kind.CLIENT)
-      .build();
-
-    byte[] result = prefixWithTimestampMillisAndQuery(span, span.timestamp());
-
-    assertThat(new String(result, "UTF-8"))
-      .startsWith("{\"traceId\":\"");
-  }
-
-  @Test public void prefixWithTimestampMillisAndQuery_addsTimestampMillis() throws Exception {
-    Span span = Span.newBuilder().traceId("20").id("22").name("").parentId("21").timestamp(1L)
-      .localEndpoint(WEB_ENDPOINT)
-      .kind(Kind.CLIENT)
-      .build();
-
-    byte[] result = prefixWithTimestampMillisAndQuery(span, span.timestamp());
-
-    assertThat(new String(result, "UTF-8"))
-      .startsWith("{\"timestamp_millis\":1,\"traceId\":");
-  }
-
-  @Test public void prefixWithTimestampMillisAndQuery_addsAnnotationQuery() throws Exception {
-    Span span = Span.newBuilder().traceId("20").id("22").name("").parentId("21")
-      .localEndpoint(WEB_ENDPOINT)
-      .addAnnotation(1L, "\"foo")
-      .build();
-
-    byte[] result = prefixWithTimestampMillisAndQuery(span, span.timestamp());
-
-    assertThat(new String(result, "UTF-8"))
-      .startsWith("{\"_q\":[\"\\\"foo\"],\"traceId");
-  }
-
-  @Test public void prefixWithTimestampMillisAndQuery_addsAnnotationQueryTags() throws Exception {
-    Span span = Span.newBuilder().traceId("20").id("22").name("").parentId("21")
-      .localEndpoint(WEB_ENDPOINT)
-      .putTag("\"foo", "\"bar")
-      .build();
-
-    byte[] result = prefixWithTimestampMillisAndQuery(span, span.timestamp());
-
-    assertThat(new String(result, "UTF-8"))
-      .startsWith("{\"_q\":[\"\\\"foo\",\"\\\"foo=\\\"bar\"],\"traceId");
-  }
-
-  @Test public void prefixWithTimestampMillisAndQuery_readable() throws Exception {
-    Span span = Span.newBuilder().traceId("20").id("20").name("get")
-      .timestamp(TestObjects.TODAY * 1000).build();
-
-    assertThat(
-      SpanBytesDecoder.JSON_V2.decodeOne(prefixWithTimestampMillisAndQuery(span, span.timestamp())))
-      .isEqualTo(span); // ignores timestamp_millis field
-  }
-
-  @Test public void doesntWriteDocumentId() throws Exception {
-    es.enqueue(new MockResponse());
-
-    accept(Span.newBuilder().traceId("1").id("1").name("foo").build());
-
-    RecordedRequest request = es.takeRequest();
-    assertThat(request.getBody().readByteString().utf8())
-      .doesNotContain("\"_type\":\"span\",\"_id\"");
-  }
-
-  @Test public void writesSpanNaturallyWhenNoTimestamp() throws Exception {
-    es.enqueue(new MockResponse());
+  @Test void writesSpanNaturallyWhenNoTimestamp() throws Exception {
+    server.enqueue(SUCCESS_RESPONSE);
 
     Span span = Span.newBuilder().traceId("1").id("1").name("foo").build();
     accept(Span.newBuilder().traceId("1").id("1").name("foo").build());
 
-    assertThat(es.takeRequest().getBody().readByteString().utf8())
-      .contains("\n" + new String(SpanBytesEncoder.JSON_V2.encode(span), "UTF-8") + "\n");
+    assertThat(server.takeRequest().request().contentUtf8())
+      .contains("\n" + new String(SpanBytesEncoder.JSON_V2.encode(span), UTF_8) + "\n");
   }
 
-  @Test public void traceIsSearchableByServerServiceName() throws Exception {
-    es.enqueue(new MockResponse());
+  @Test void traceIsSearchableByServerServiceName() throws Exception {
+    server.enqueue(SUCCESS_RESPONSE);
 
-    Span clientSpan = Span.newBuilder().traceId("20").id("22").name("").parentId("21")
-      .timestamp(1000L)
-      .kind(Kind.CLIENT)
-      .localEndpoint(WEB_ENDPOINT)
-      .build();
+    Span clientSpan =
+      Span.newBuilder()
+        .traceId("20")
+        .id("22")
+        .name("")
+        .parentId("21")
+        .timestamp(1000L)
+        .kind(Kind.CLIENT)
+        .localEndpoint(WEB_ENDPOINT)
+        .build();
 
-    Span serverSpan = Span.newBuilder().traceId("20").id("22").name("get").parentId("21")
-      .timestamp(2000L)
-      .kind(Kind.SERVER)
-      .localEndpoint(APP_ENDPOINT)
-      .build();
+    Span serverSpan =
+      Span.newBuilder()
+        .traceId("20")
+        .id("22")
+        .name("get")
+        .parentId("21")
+        .timestamp(2000L)
+        .kind(Kind.SERVER)
+        .localEndpoint(APP_ENDPOINT)
+        .build();
 
     accept(serverSpan, clientSpan);
 
     // make sure that both timestamps are in the index
-    assertThat(es.takeRequest().getBody().readByteString().utf8())
+    assertThat(server.takeRequest().request().contentUtf8())
       .contains("{\"timestamp_millis\":2")
       .contains("{\"timestamp_millis\":1");
   }
 
-  @Test public void addsPipelineId() throws Exception {
-    close();
-
-    storage = ElasticsearchStorage.newBuilder()
-      .hosts(asList(es.url("").toString()))
+  @Test void addsPipelineId() throws Exception {
+    storage.close();
+    storage = ElasticsearchStorage.newBuilder(() -> WebClient.of(server.httpUri()))
       .pipeline("zipkin")
       .build();
     ensureIndexTemplate();
 
-    es.enqueue(new MockResponse());
+    server.enqueue(SUCCESS_RESPONSE);
 
     accept(Span.newBuilder().traceId("1").id("1").name("foo").build());
 
-    RecordedRequest request = es.takeRequest();
-    assertThat(request.getPath())
-      .isEqualTo("/_bulk?pipeline=zipkin");
+    AggregatedHttpRequest request = server.takeRequest().request();
+    assertThat(request.path()).isEqualTo("/_bulk?pipeline=zipkin");
   }
 
-  @Test public void dropsWhenBacklog() throws Exception {
-    close();
+  @Test void choosesTypeSpecificIndex() throws Exception {
+    server.enqueue(SUCCESS_RESPONSE);
 
-    storage = ElasticsearchStorage.newBuilder()
-      .hosts(asList(es.url("").toString()))
-      .maxRequests(1)
-      .build();
-    ensureIndexTemplate();
-    es.enqueue(new MockResponse().setBodyDelay(1, TimeUnit.SECONDS));
-
-    final LinkedBlockingQueue<Object> q = new LinkedBlockingQueue<>();
-    Callback<Void> callback = new Callback<Void>() {
-      @Override public void onSuccess(@Nullable Void value) {
-        q.add("success");
-      }
-
-      @Override public void onError(Throwable t) {
-        q.add(t);
-      }
-    };
-    // one request is delayed
-    storage.spanConsumer().accept(asList(TestObjects.CLIENT_SPAN)).enqueue(callback);
-
-    // synchronous requests fail on backlog
-    try {
-      storage.spanConsumer().accept(asList(TestObjects.CLIENT_SPAN)).execute();
-      failBecauseExceptionWasNotThrown(IllegalStateException.class);
-    } catch (IllegalStateException e) {
-    }
-
-    // asynchronous requests fail on backlog
-    storage.spanConsumer().accept(asList(TestObjects.CLIENT_SPAN)).enqueue(callback);
-
-    assertThat(q.take())
-      .isInstanceOf(IllegalStateException.class);
-  }
-
-  @Test public void choosesTypeSpecificIndex() throws Exception {
-    es.enqueue(new MockResponse());
-
-    Span span = Span.newBuilder().traceId("1").id("2").parentId("1").name("s")
-      .localEndpoint(APP_ENDPOINT)
-      .addAnnotation(TimeUnit.DAYS.toMicros(365) /* 1971-01-01 */, "foo")
-      .build();
+    Span span =
+      Span.newBuilder()
+        .traceId("1")
+        .id("2")
+        .parentId("1")
+        .name("s")
+        .localEndpoint(APP_ENDPOINT)
+        .addAnnotation(TimeUnit.DAYS.toMicros(365) /* 1971-01-01 */, "foo")
+        .build();
 
     // sanity check data
     assertThat(span.timestamp()).isNull();
@@ -244,12 +162,120 @@ public class ElasticsearchSpanConsumerTest {
     accept(span);
 
     // index timestamp is the server timestamp, not current time!
-    assertThat(es.takeRequest().getBody().readByteString().utf8()).contains(
-      "{\"index\":{\"_index\":\"zipkin:span-1971-01-01\",\"_type\":\"span\"}}"
-    );
+    assertThat(server.takeRequest().request().contentUtf8())
+      .startsWith("{\"index\":{\"_index\":\"zipkin:span-1971-01-01\",\"_type\":\"span\"");
+  }
+
+  /** Much simpler template which doesn't write the timestamp_millis field */
+  @Test void searchDisabled_simplerIndexTemplate() throws Exception {
+    storage.close();
+    storage = ElasticsearchStorage.newBuilder(() -> WebClient.of(server.httpUri()))
+      .searchEnabled(false)
+      .build();
+
+    server.enqueue(AggregatedHttpResponse.of(HttpStatus.OK, MediaType.JSON_UTF_8,
+      "{\"version\":{\"number\":\"6.0.0\"}}"));
+    server.enqueue(AggregatedHttpResponse.of(HttpStatus.NOT_FOUND)); // get span template
+    server.enqueue(SUCCESS_RESPONSE); // put span template
+    server.enqueue(SUCCESS_RESPONSE); // get dependency template
+    server.enqueue(SUCCESS_RESPONSE); // get tags template
+    storage.ensureIndexTemplates();
+    server.takeRequest(); // get version
+    server.takeRequest(); // get span template
+
+    assertThat(server.takeRequest().request().contentUtf8()) // put span template
+      .contains(
+        """
+          "mappings": {
+            "span": {
+              "properties": {
+                "traceId": { "type": "keyword", "norms": false },
+                "annotations": { "enabled": false },
+                "tags": { "enabled": false }
+              }
+            }
+          }
+        """);
+  }
+
+  /** Less overhead as a span json isn't rewritten to include a millis timestamp */
+  @Test void searchDisabled_doesntAddTimestampMillis() throws Exception {
+    storage.close();
+    storage = ElasticsearchStorage.newBuilder(() -> WebClient.of(server.httpUri()))
+      .searchEnabled(false)
+      .build();
+    ensureIndexTemplates(storage);
+    server.enqueue(SUCCESS_RESPONSE); // for the bulk request
+
+    Span span =
+      Span.newBuilder().traceId("20").id("20").name("get").timestamp(TODAY * 1000).build();
+
+    storage.spanConsumer().accept(List.of(span)).execute();
+
+    assertThat(server.takeRequest().request().contentUtf8()).doesNotContain("timestamp_millis");
+  }
+
+  @Test void addsAutocompleteValue() throws Exception {
+    server.enqueue(SUCCESS_RESPONSE);
+
+    accept(Span.newBuilder().traceId("1").id("1").timestamp(1).putTag("environment", "A").build());
+
+    assertThat(server.takeRequest().request().contentUtf8())
+      .endsWith("""
+        {"index":{"_index":"zipkin:autocomplete-1970-01-01","_type":"autocomplete","_id":"environment=A"}}
+        {"tagKey":"environment","tagValue":"A"}
+        """);
+  }
+
+  @Test void addsAutocompleteValue_suppressesWhenSameDay() throws Exception {
+    server.enqueue(SUCCESS_RESPONSE);
+    server.enqueue(SUCCESS_RESPONSE);
+
+    Span s = Span.newBuilder().traceId("1").id("1").timestamp(1).putTag("environment", "A").build();
+    accept(s);
+    accept(s.toBuilder().id(2).build());
+
+    server.takeRequest(); // skip first
+    // the tag is in the same date range as the other, so it should not write the tag again
+    assertThat(server.takeRequest().request().contentUtf8())
+      .doesNotContain("autocomplete");
+  }
+
+  @Test void addsAutocompleteValue_differentDays() throws Exception {
+    server.enqueue(SUCCESS_RESPONSE);
+    server.enqueue(SUCCESS_RESPONSE);
+
+    Span s = Span.newBuilder().traceId("1").id("1").timestamp(1).putTag("environment", "A").build();
+    accept(s);
+    accept(s.toBuilder().id(2).timestamp(1 + TimeUnit.DAYS.toMicros(1)).build());
+
+    server.takeRequest(); // skip first
+    // different day == different context
+    assertThat(server.takeRequest().request().contentUtf8())
+      .endsWith("""
+        {"index":{"_index":"zipkin:autocomplete-1970-01-02","_type":"autocomplete","_id":"environment=A"}}
+        {"tagKey":"environment","tagValue":"A"}
+        """);
+  }
+
+  @Test void addsAutocompleteValue_revertsSuppressionOnFailure() throws Exception {
+    server.enqueue(AggregatedHttpResponse.of(HttpStatus.INTERNAL_SERVER_ERROR));
+    server.enqueue(SUCCESS_RESPONSE);
+
+    Span s = Span.newBuilder().traceId("1").id("1").timestamp(1).putTag("environment", "A").build();
+    try {
+      accept(s);
+      failBecauseExceptionWasNotThrown(RuntimeException.class);
+    } catch (RuntimeException expected) {
+    }
+    accept(s);
+
+    // We only cache when there was no error.. the second request should be same as the first
+    assertThat(server.takeRequest().request().contentUtf8())
+      .isEqualTo(server.takeRequest().request().contentUtf8());
   }
 
   void accept(Span... spans) throws Exception {
-    storage.spanConsumer().accept(asList(spans)).execute();
+    spanConsumer.accept(List.of(spans)).execute();
   }
 }

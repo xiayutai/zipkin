@@ -1,39 +1,39 @@
-# storage-elasticsearch-http
+# storage-elasticsearch
 
-This is is a plugin to the Elasticsearch storage component, which uses
-HTTP by way of [OkHttp 3](https://github.com/square/okttp) and
-[Moshi](https://github.com/square/moshi). This currently supports 2.x,
-5.x and 6.x version families.
+This is a plugin to the Elasticsearch storage component, which uses
+HTTP by way of [Armeria](https://github.com/line/armeria) and
+[Jackson](https://github.com/FasterXML/jackson). This uses Elasticsearch 5+
+features, but is tested against Elasticsearch 8-9.x and OpenSearch 2.x.
 
 ## Multiple hosts
 Most users will supply a DNS name that's mapped to multiple A or AAAA
 records. For example, `http://elasticsearch:9200` will use normal host
-lookups to get the list of IP addresses.
-
-You can alternatively supply a list of http base urls. This list is used
-to recover from failures. Note that all ports must be the same, and the
-scheme must be http, not https.
+lookups to get the list of IP addresses, though you can alternatively supply
+a list of http base urls. In either case, all the resolved IP addresses
+from all provided hosts will be iterated over round-robin, with requests made
+only to healthy addresses.
 
 Here are some examples:
 
-* http://1.1.1.1:9200,http://2.2.2.2:9200
-* http://1.1.1.1:9200,http://[2001:db8::c001]:9200
-* http://elasticsearch:9200,http://1.2.3.4:9200
-* http://elasticsearch-1:9200,http://elasticsearch-2:9200
+* `http://1.1.1.1:9200,http://2.2.2.2:19200`
+* `http://1.1.1.1:9200,http://[2001:db8::c001]:9200`
+* `http://elasticsearch:9200,http://1.2.3.4:9200`
+* `http://elasticsearch-1:9200,http://elasticsearch-2:9200`
 
 ## Format
-Spans are stored in version 2 format, which is the same as the [v2 POST endpoint](http://zipkin.io/zipkin-api/#/default/post_spans)
+Spans are stored in version 2 format, which is the same as the [v2 POST endpoint](https://zipkin.io/zipkin-api/#/default/post_spans)
 with one difference described below. We add a "timestamp_millis" field
 to aid in integration with other tools.
 
 ### Timestamps
-Zipkin's timestamps are in epoch microseconds, which is not a supported date type in Elasticsearch.
+Zipkin's timestamps are in epoch microseconds, which is not a supported date type in Elasticsearch / OpenSearch.
 In consideration of tools like like Kibana, this component adds "timestamp_millis" when writing
-spans. This is mapped to the Elasticsearch date type, so can be used to any date-based queries.
+spans. This is mapped to the Elasticsearch / OpenSearch date type, so can be used to any date-based queries.
 
 ## Indexes
 Spans are stored into daily indices, for example spans with a timestamp
-falling on 2016/03/19 will be stored in the index named 'zipkin:span-2016-03-19'.
+falling on 2016/03/19 will be stored in the index named 'zipkin:span-2016-03-19'
+or 'zipkin-span-2016-03-19' if using Elasticsearch version 7 or higher.
 There is no support for TTL through this SpanStore. It is recommended
 instead to use [Elastic Curator](https://www.elastic.co/guide/en/elasticsearch/client/curator/current/about.html)
 to remove indices older than the point you are interested in.
@@ -45,9 +45,9 @@ the date separator from '-' to something else.
 `ElasticsearchStorage.Builder.index` and `ElasticsearchStorage.Builder.dateSeparator`
 control the daily index format.
 
-For example, spans with a timestamp falling on 2016/03/19 end up in the
-index 'zipkin:span-2016-03-19'. When the date separator is '.', the index
-would be 'zipkin:span-2016.03.19'.
+For example, using Elasticsearch 7+, spans with a timestamp falling on
+2016/03/19 end up in the index 'zipkin-span-2016-03-19'. When the date
+separator is '.', the index would be 'zipkin-span-2016.03.19'.
 
 ### String Mapping
 The Zipkin api implies aggregation and exact match (keyword) on string
@@ -63,13 +63,14 @@ The values in `q` are limited to 256 characters and searched as keywords.
 
 You can check these manually like so:
 ```bash
-$ curl -s localhost:9200/zipkin:span-2017-08-11/_search?q=_q:error=500
+$ curl -s 'localhost:9200/zipkin*span-2017-08-11/_search?q=_q:error=500'
 ```
 
 The reason for special casing is around dotted name constraints. Tags
 are stored as a dictionary. Some keys include inconsistent number of dots
-(ex "error" and "error.message"). Elasticsearch cannot index these as it
-inteprets them as fields, and dots in fields imply an object path.
+(ex "error" and "error.message"). Elasticsearch / OpenSearch cannot index
+these as it inteprets them as fields, and dots in fields imply an object
+path.
 
 ### Trace Identifiers
 Unless `ElasticsearchStorage.Builder.strictTraceId` is set to false,
@@ -103,7 +104,7 @@ your indexes:
 
 ```bash
 # the output below shows which tokens will match on the trace id supplied.
-$ curl -s localhost:9200/zipkin:span-2017-08-22/_analyze -d '{
+$ curl -s 'localhost:9200/zipkin*span-2017-08-22/_analyze' -d '{
       "text": "48485a3953bb61246b221d5bc9e6496c",
       "analyzer": "traceId_analyzer"
   }'|jq '.tokens|.[]|.token'
@@ -111,10 +112,37 @@ $ curl -s localhost:9200/zipkin:span-2017-08-22/_analyze -d '{
   "6b221d5bc9e6496c"
 ```
 
+### Disabling indexing
+Indexing is a good default, but some sites who don't use Zipkin UI's
+"Find a Trace" screen may want to disable indexing. This means templates
+will opt-out of analyzing any data in `span`, except `traceId`. This
+also means the special fields `_q` and `timestamp_millis` will neither
+be written, nor analyzed.
+
+[Disabling search](../../README.md#disabling-search) disables indexing.
+
+### Composable Index Template
+Elasticsearch 7.8 introduces [composable templates](https://www.elastic.co/guide/en/elasticsearch/reference/current/index-templates.html) and
+deprecates [legacy/v1 templates](https://www.elastic.co/guide/en/elasticsearch/reference/current/indices-templates-v1.html) used in version prior (fully supported by OpenSearch).
+Merging of multiple templates with matching index patterns is no longer allowed, and Elasticsearch / OpenSearch will return error on PUT of the second template
+with matching index pattern and priority. Templates with matching index patterns are required to have different priorities, and Elasticsearch / OpenSearch will
+only use the template with the highest priority. This also means that [secondary template](https://gist.github.com/codefromthecrypt/1af1259102e7a2da1b3c9103565165d7)
+is no longer achievable.
+
+By default, Zipkin will use legacy template during initialization, but you can opt to use composable template by
+providing `ES_TEMPLATE_PRIORITY` environment variable.
+
 ## Customizing the ingest pipeline
 
-When using Elasticsearch 5.x, you can setup an [ingest pipeline](https://www.elastic.co/guide/en/elasticsearch/reference/master/pipeline.html)
-to perform custom processing.
+### Elasticsearch
+
+You can setup an [ingest pipeline](https://www.elastic.co/guide/en/elasticsearch/reference/master/pipeline.html) to perform custom processing.
+
+### OpenSearch
+
+You can setup an [ingest pipeline](https://opensearch.org/docs/latest/ingest-pipelines/) to perform custom processing.
+
+### Setting up ingest pipeline
 
 Here's an example, which you'd setup prior to configuring Zipkin to use
 it via `ElasticsearchStorage.Builder.pipeline`
@@ -134,3 +162,21 @@ PUT _ingest/pipeline/zipkin
   ]
 }
 ```
+
+## Tuning
+
+### Autocomplete indexing
+Redundant requests to store autocomplete values are ignored for an hour
+to reduce load. This is implemented by
+[DelayLimiter](../../zipkin/src/main/java/zipkin2/internal/DelayLimiter.java)
+
+## Data retention
+Zipkin-server does not handle retention management of the trace data. Use the tools recommended by to manage data retention, or your cluster will grow indefinitely!
+
+### Elasticsearch
+ * [Curator](https://www.elastic.co/guide/en/elasticsearch/client/curator/current/index.html)
+ * [Index Lifecycle Management](https://www.elastic.co/guide/en/elasticsearch/reference/7.3/index-lifecycle-management.html)
+
+### OpenSearch
+ * [Curator](https://github.com/flant/curator-opensearch)
+ * [Index Lifecycle Management](https://opensearch.org/docs/latest/im-plugin/ism/index/)
